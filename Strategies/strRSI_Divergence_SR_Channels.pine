@@ -1,0 +1,223 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © NakedMind
+
+//@version=6
+strategy("RSI Divergence + Support/Resistance Channels [STRATEGY]", overlay=true, max_bars_back=501, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+//====================================================
+// 🔹 GROUPS
+//====================================================
+group_rsi = "RSI Divergence Settings"
+group_sr  = "Support & Resistance Settings"
+group_trd = "Trade Management"
+
+//====================================================
+// 🔹 RSI SETTINGS
+//====================================================
+enable_rsi = input.bool(true, "Enable RSI Divergence", group=group_rsi)
+
+len  = input.int(14, "RSI Period", group=group_rsi)
+src  = input.source(close, "RSI Source", group=group_rsi)
+lbR  = input.int(5, "Pivot Lookback Right", group=group_rsi)
+lbL  = input.int(5, "Pivot Lookback Left", group=group_rsi)
+rangeUpper = input.int(60, "Max Lookback", group=group_rsi)
+rangeLower = input.int(5, "Min Lookback", group=group_rsi)
+
+plotBull        = input.bool(true, "Regular Bullish", group=group_rsi)
+plotHiddenBull  = input.bool(false, "Hidden Bullish", group=group_rsi)
+plotBear        = input.bool(true, "Regular Bearish", group=group_rsi)
+plotHiddenBear  = input.bool(false, "Hidden Bearish", group=group_rsi)
+
+//====================================================
+// 🔹 TRADE SETTINGS
+//====================================================
+useSL      = input.bool(true, "Use Stop Loss (%)", group=group_trd)
+slPerc     = input.float(1.0, "Stop Loss %", step=0.1, group=group_trd)
+rr         = input.float(2.0, "Risk Reward Ratio (TP = SL * RR)", step=0.1, group=group_trd)
+
+//====================================================
+// 🔹 SR SETTINGS
+//====================================================
+enable_sr = input.bool(true, "Enable Support/Resistance", group=group_sr)
+
+prd         = input.int(10, "Pivot Period", group=group_sr)
+ppsrc       = input.string("High/Low", "Source", options=["High/Low","Close/Open"], group=group_sr)
+ChannelW    = input.int(5, "Channel Width %", group=group_sr)
+minstrength = input.int(1, "Minimum Strength", group=group_sr)
+maxnumsr    = input.int(6, "Max Levels", group=group_sr) - 1
+loopback    = input.int(290, "Loopback", group=group_sr)
+
+res_col = input.color(color.new(color.red,75), "Resistance Color", group=group_sr)
+sup_col = input.color(color.new(color.lime,75), "Support Color", group=group_sr)
+inch_col= input.color(color.new(color.gray,75), "Inside Color", group=group_sr)
+
+//====================================================
+// 🔹 RSI CALC
+//====================================================
+osc = ta.rsi(src, len)
+
+//====================================================
+// 🔹 RSI DIVERGENCE LOGIC (UNCHANGED)
+//====================================================
+plFound = not na(ta.pivotlow(osc, lbL, lbR))
+phFound = not na(ta.pivothigh(osc, lbL, lbR))
+
+_inRange(cond) =>
+    bars = ta.barssince(cond)
+    rangeLower <= bars and bars <= rangeUpper
+
+oscHL = osc[lbR] > ta.valuewhen(plFound, osc[lbR], 1) and _inRange(plFound[1])
+priceLL = low[lbR] < ta.valuewhen(plFound, low[lbR], 1)
+bullCond = enable_rsi and plotBull and priceLL and oscHL and plFound
+
+oscLL = osc[lbR] < ta.valuewhen(plFound, osc[lbR], 1) and _inRange(plFound[1])
+priceHL = low[lbR] > ta.valuewhen(plFound, low[lbR], 1)
+hiddenBullCond = enable_rsi and plotHiddenBull and priceHL and oscLL and plFound
+
+oscLH = osc[lbR] < ta.valuewhen(phFound, osc[lbR], 1) and _inRange(phFound[1])
+priceHH = high[lbR] > ta.valuewhen(phFound, high[lbR], 1)
+bearCond = enable_rsi and plotBear and priceHH and oscLH and phFound
+
+oscHH = osc[lbR] > ta.valuewhen(phFound, osc[lbR], 1) and _inRange(phFound[1])
+priceLH = high[lbR] < ta.valuewhen(phFound, high[lbR], 1)
+hiddenBearCond = enable_rsi and plotHiddenBear and priceLH and oscHH and phFound
+
+//====================================================
+// 🔹 PLOTS (UNCHANGED)
+//====================================================
+plotshape(bullCond, offset=-lbR, location=location.belowbar, color=color.lime, style=shape.labelup, text="Bull")
+plotshape(hiddenBullCond, offset=-lbR, location=location.belowbar, color=color.new(color.lime,70), style=shape.labelup, text="H Bull")
+
+plotshape(bearCond, offset=-lbR, location=location.abovebar, color=color.red, style=shape.labeldown, text="Bear")
+plotshape(hiddenBearCond, offset=-lbR, location=location.abovebar, color=color.new(color.red,70), style=shape.labeldown, text="H Bear")
+
+//====================================================
+// 🔹 SUPPORT / RESISTANCE ENGINE (UNCHANGED)
+//====================================================
+float src1 = ppsrc == 'High/Low' ? high : math.max(close, open)
+float src2 = ppsrc == 'High/Low' ? low  : math.min(close, open)
+
+ph = ta.pivothigh(src1, prd, prd)
+pl = ta.pivotlow(src2, prd, prd)
+
+prdhighest = ta.highest(300)
+prdlowest  = ta.lowest(300)
+cwidth = (prdhighest - prdlowest) * ChannelW / 100
+
+var pivotvals = array.new_float()
+var pivotlocs = array.new_float()
+
+if enable_sr and (not na(ph) or not na(pl))
+    array.unshift(pivotvals, not na(ph) ? ph : pl)
+    array.unshift(pivotlocs, bar_index)
+
+    for i = array.size(pivotvals)-1 to 0
+        if bar_index - array.get(pivotlocs,i) > loopback
+            array.pop(pivotvals)
+            array.pop(pivotlocs)
+
+get_sr_vals(ind)=>
+    float lo = array.get(pivotvals, ind)
+    float hi = lo
+    int numpp = 0
+    for y=0 to array.size(pivotvals)-1
+        float cpp = array.get(pivotvals,y)
+        float wdth = cpp <= hi ? hi-cpp : cpp-lo
+        if wdth <= cwidth
+            lo := math.min(lo, cpp)
+            hi := math.max(hi, cpp)
+            numpp += 20
+    [hi,lo,numpp]
+
+//====================================================
+// 🔹 BUILD CHANNELS
+//====================================================
+var srArr = array.new_float(20,0)
+
+if enable_sr and (not na(ph) or not na(pl))
+    supres = array.new_float()
+    for i=0 to array.size(pivotvals)-1
+        [hi,lo,str]=get_sr_vals(i)
+        array.push(supres,str)
+        array.push(supres,hi)
+        array.push(supres,lo)
+
+    array.fill(srArr,0)
+
+    idx=0
+    for i=0 to array.size(pivotvals)-1
+        if idx >= 10
+            break
+        hh = array.get(supres,i*3+1)
+        ll = array.get(supres,i*3+2)
+        array.set(srArr,idx*2,hh)
+        array.set(srArr,idx*2+1,ll)
+        idx+=1
+
+//====================================================
+// 🔹 DRAW BOXES (UNCHANGED)
+//====================================================
+var srBoxes = array.new_box(10)
+
+for i=0 to math.min(9,maxnumsr)
+    box.delete(array.get(srBoxes,i))
+    top = array.get(srArr,i*2)
+    bot = array.get(srArr,i*2+1)
+
+    if top != 0
+        col = top > close ? res_col : sup_col
+        array.set(srBoxes,i,
+            box.new(bar_index,top,bar_index+1,bot,
+                extend=extend.both,
+                bgcolor=col,
+                border_color=col))
+
+//====================================================
+// 🔹 SR FILTER (OPTIONAL)
+//====================================================
+nearSR = true
+if enable_sr
+    nearSR := false
+    for i=0 to 9
+        top = array.get(srArr,i*2)
+        bot = array.get(srArr,i*2+1)
+        if top != 0 and close <= top and close >= bot
+            nearSR := true
+
+//====================================================
+// 🔹 ENTRY CONDITIONS (NEXT BAR EXECUTION)
+//====================================================
+longSignal  = (bullCond or hiddenBullCond) and nearSR
+shortSignal = (bearCond or hiddenBearCond) and nearSR
+
+// Ensure execution AFTER close → orders fill next bar open automatically
+if (longSignal and strategy.position_size <= 0)
+    strategy.close("Short")
+    strategy.entry("Long", strategy.long)
+
+if (shortSignal and strategy.position_size >= 0)
+    strategy.close("Long")
+    strategy.entry("Short", strategy.short)
+
+//====================================================
+// 🔹 STOP LOSS & TAKE PROFIT
+//====================================================
+if strategy.position_size > 0
+    sl = strategy.position_avg_price * (1 - slPerc/100)
+    tp = strategy.position_avg_price * (1 + (slPerc * rr)/100)
+    strategy.exit("Long Exit", "Long", stop=useSL ? sl : na, limit=tp)
+
+if strategy.position_size < 0
+    sl = strategy.position_avg_price * (1 + slPerc/100)
+    tp = strategy.position_avg_price * (1 - (slPerc * rr)/100)
+    strategy.exit("Short Exit", "Short", stop=useSL ? sl : na, limit=tp)
+
+//====================================================
+// 🔹 ALERTS
+//====================================================
+alertcondition(longSignal, "Buy Signal", "Bullish RSI Divergence Strategy Entry")
+alertcondition(shortSignal, "Sell Signal", "Bearish RSI Divergence Strategy Entry")
+alertcondition(bullCond, "Bullish Divergence", "Bullish RSI Divergence")
+alertcondition(bearCond, "Bearish Divergence", "Bearish RSI Divergence")
+alertcondition(hiddenBullCond, "Hidden Bullish", "Hidden Bullish Divergence")
+alertcondition(hiddenBearCond, "Hidden Bearish", "Hidden Bearish Divergence")
