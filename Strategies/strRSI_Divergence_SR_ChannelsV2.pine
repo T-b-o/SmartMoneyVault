@@ -1,0 +1,675 @@
+// ============================================================
+// RSI Divergence + S/R Channels [ENHANCED v3 — FOREX OPTIMIZED]
+// ============================================================
+// This strategy combines RSI divergence detection with dynamic
+// Support/Resistance zones, trend filtering, chop filtering,
+// and session management to produce high-confluence trade signals.
+//
+// VERSION HISTORY:
+//   v1 — Base RSI divergence + S/R channels
+//   v2 — Added filters (EMA, ADX, Session), ATR SL/TP, visual zones
+//   v3 — Forex-specific optimizations:
+//         1.  S/R proximity uses ATR buffer + wick-based detection
+//         2.  S/R zone polarity locked at creation (pivot high → resistance, pivot low → support)
+//         3.  S/R zone width uses ATR instead of fixed %
+//         4.  Multi-timeframe EMA trend filter (Daily EMA)
+//         5.  Increased slippage for realistic forex fills
+//         6.  ADX threshold raised to 25 for forex
+//         7.  Asian session option for JPY/AUD/NZD pairs
+//         8.  Session-end auto-close to avoid swap costs
+//         9.  Trailing stop alternative to fixed TP
+//        10.  Reduced divergence lookback-right for lower TFs
+//        11.  Fixed-risk position sizing (% equity per trade)
+//        12.  minstrength filter now applied (was unused)
+//        13.  Candlestick pattern confirmation at S/R zones
+//
+// RECOMMENDED TIMEFRAMES: 15m, 1H
+// RECOMMENDED PAIRS: Major forex pairs (EUR/USD, GBP/USD, USD/JPY, etc.)
+// ============================================================
+
+//@version=6
+strategy("RSI Divergence + S/R Channels [FOREX v3]",
+     overlay=true,
+     max_bars_back=501,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     commission_type=strategy.commission.percent,
+     commission_value=0.007,            // FIX #3: realistic ECN commission
+     slippage=8)                        // FIX #3: realistic forex slippage (~0.8 pips on 5-digit)
+
+// ============================================================
+// 🔹 GROUPS
+// ============================================================
+group_rsi    = "RSI Divergence Settings"
+group_sr     = "Support & Resistance Settings"
+group_trd    = "Trade Management"
+group_filt   = "🔎 Filters (Trend / Session / Chop)"
+group_vis    = "🎨 Visual Trade Zones"
+group_candle = "🕯 Candlestick Patterns at S/R"
+
+// ============================================================
+// 🔹 VISUAL ZONES SETTINGS
+// ============================================================
+showZones   = input.bool(true,  "Show Trade Zones (SL/TP boxes)", group=group_vis)
+tpZoneCol   = input.color(color.new(color.green, 80), "TP Zone Color", group=group_vis)
+slZoneCol   = input.color(color.new(color.red,   80), "SL Zone Color", group=group_vis)
+
+// ============================================================
+// 🔹 RSI SETTINGS
+// ============================================================
+enable_rsi      = input.bool(true,  "Enable RSI Divergence",  group=group_rsi)
+len             = input.int(14,     "RSI Period",              group=group_rsi)
+src             = input.source(close,"RSI Source",             group=group_rsi)
+lbR             = input.int(3,      "Pivot Lookback Right",    group=group_rsi, tooltip="FIX #10: Reduced from 5 to 3 for less lag on lower TFs. On 15m, 3 bars = 45 min vs 75 min.")
+lbL             = input.int(5,      "Pivot Lookback Left",     group=group_rsi)
+rangeUpper      = input.int(60,     "Max Lookback",            group=group_rsi)
+rangeLower      = input.int(5,      "Min Lookback",            group=group_rsi)
+plotBull        = input.bool(true,  "Regular Bullish",         group=group_rsi)
+plotHiddenBull  = input.bool(false, "Hidden Bullish",          group=group_rsi)
+plotBear        = input.bool(true,  "Regular Bearish",         group=group_rsi)
+plotHiddenBear  = input.bool(false, "Hidden Bearish",          group=group_rsi)
+
+// ============================================================
+// 🔹 TRADE MANAGEMENT SETTINGS
+// ============================================================
+useATRSL      = input.bool(true,  "Use ATR-Based SL (else % SL)",      group=group_trd)
+atrLen        = input.int(14,     "ATR Period",                         group=group_trd)
+atrMult       = input.float(1.5,  "ATR SL Multiplier",  step=0.1,      group=group_trd)
+slPerc        = input.float(1.0,  "Stop Loss % (if ATR off)", step=0.1, group=group_trd)
+rr            = input.float(2.0,  "Risk:Reward Ratio (TP = SL×RR)", step=0.1, group=group_trd)
+
+// FIX #11: Fixed-risk position sizing
+useFixedRisk  = input.bool(true,  "Use Fixed-Risk Sizing",             group=group_trd, tooltip="FIX #11: Calculate position size so each trade risks a fixed % of equity, regardless of SL distance.")
+riskPerTrade  = input.float(2.0,  "Risk Per Trade (%)",  step=0.5, minval=0.5, maxval=10.0, group=group_trd)
+
+// FIX #8: Trailing stop alternative
+useTrailing   = input.bool(false, "Use Trailing Stop (instead of fixed TP)", group=group_trd, tooltip="FIX #8: ATR-based trailing stop captures trending moves better than fixed TP.")
+trailAtrMult  = input.float(2.0,  "Trailing Stop ATR Multiplier", step=0.1, group=group_trd)
+
+// FIX #7: Session-end auto-close
+autoCloseEOD  = input.bool(true,  "Auto-Close at Session End (avoid swaps)", group=group_trd, tooltip="FIX #7: Closes all positions when outside active session windows to avoid overnight swap costs.")
+
+// ============================================================
+// 🔹 SR SETTINGS
+// ============================================================
+enable_sr     = input.bool(true,     "Enable Support/Resistance",  group=group_sr)
+prd           = input.int(10,        "Pivot Period",                group=group_sr)
+ppsrc         = input.string("High/Low","Source", options=["High/Low","Close/Open"], group=group_sr)
+ChannelW      = input.int(5,         "Channel Width % (fallback)",  group=group_sr)
+useAtrWidth   = input.bool(true,     "Use ATR-Based Zone Width",    group=group_sr, tooltip="FIX #9: Uses ATR × multiplier for zone width instead of fixed %. Adapts to each pair's volatility.")
+atrWidthMult  = input.float(2.0,     "Zone Width ATR Multiplier",   step=0.5, group=group_sr)
+minstrength   = input.int(1,         "Minimum Strength",            group=group_sr, tooltip="FIX #12: Zones with fewer than this many pivot touches are filtered out.")
+maxnumsr      = input.int(6,         "Max Levels",                  group=group_sr) - 1
+loopback      = input.int(290,       "Loopback",                    group=group_sr)
+res_col       = input.color(color.new(color.red,  75), "Resistance Color", group=group_sr)
+sup_col       = input.color(color.new(color.lime, 75), "Support Color",    group=group_sr)
+inch_col      = input.color(color.new(color.gray, 75), "Inside Color",     group=group_sr)
+srProxBuffer  = input.float(0.5,     "S/R Proximity ATR Buffer",    step=0.1, group=group_sr, tooltip="FIX #1: Extends zone detection by ATR × this value. Catches wicks that probe zones.")
+
+// ============================================================
+// 🔹 FILTER SETTINGS
+// ============================================================
+// --- Trend Filter ---
+useTrend      = input.bool(true,  "Use EMA Trend Filter",           group=group_filt)
+emaLen        = input.int(200,    "Trend EMA Length",                group=group_filt)
+useMTFTrend   = input.bool(true,  "Use Daily EMA (Multi-Timeframe)", group=group_filt, tooltip="FIX #5: Reads EMA from the daily timeframe for genuine trend context, regardless of chart TF.")
+
+// --- Chop Filter (ADX) ---
+useChop       = input.bool(true,  "Filter Choppy Markets (ADX)",    group=group_filt)
+adxLen        = input.int(14,     "ADX Length",                     group=group_filt)
+adxThresh     = input.int(25,     "Min ADX (>25 = trending)",       group=group_filt, tooltip="FIX #6: Raised from 20 to 25. Forex majors often hover 20-25 even when ranging.")
+
+// --- Session Filter ---
+useSession    = input.bool(true,  "Use Session Filter",             group=group_filt)
+londonSess    = input.session("0700-1600", "London Session (UTC)",   group=group_filt)
+nySess        = input.session("1200-2100", "New York Session (UTC)", group=group_filt)
+// FIX #4: Asian session for JPY/AUD/NZD pairs
+useAsianSess  = input.bool(false, "Include Asian Session",           group=group_filt, tooltip="FIX #4: Enable for JPY, AUD, NZD pairs that move most during Tokyo hours.")
+asianSess     = input.session("0000-0900", "Asian Session (UTC)",    group=group_filt)
+
+// ============================================================
+// 🔹 CANDLESTICK PATTERN SETTINGS
+// ============================================================
+enableCandle  = input.bool(true,  "Enable Candlestick Patterns at S/R", group=group_candle)
+
+// ============================================================
+// 🔹 MAJOR PAIRS FILTER
+// Only allows signals on the 7 major forex pairs.
+// Compares syminfo.basecurrency + syminfo.currency to the major list.
+// If the current chart is not a major pair, all signals are suppressed.
+// ============================================================
+group_pair   = "🌐 Pair Filter"
+usePairFilter = input.bool(true, "Restrict to Major Pairs Only", group=group_pair, tooltip="When enabled, signals only fire on EUR/USD, GBP/USD, USD/JPY, AUD/USD, USD/CHF, USD/CAD, NZD/USD.")
+
+_isMajorPair() =>
+    sym = syminfo.basecurrency + syminfo.currency
+    sym == "EURUSD" or sym == "GBPUSD" or sym == "USDJPY" or
+     sym == "AUDUSD" or sym == "USDCHF" or sym == "USDCAD" or
+     sym == "NZDUSD"
+
+isMajor = not usePairFilter or _isMajorPair()
+
+// ============================================================
+// 🔹 RSI CALCULATION
+// ============================================================
+osc = ta.rsi(src, len)
+
+// ============================================================
+// 🔹 RSI DIVERGENCE LOGIC  *** CORE LOGIC PRESERVED ***
+// Detects regular and hidden bullish/bearish divergences by
+// comparing price pivots against RSI pivots within a lookback window.
+// `plFound`/`phFound` confirm pivots with lbL left + lbR right bars.
+// `_inRange()` ensures the previous pivot is within [rangeLower, rangeUpper] bars.
+// ============================================================
+plFound = not na(ta.pivotlow(osc, lbL, lbR))
+phFound = not na(ta.pivothigh(osc, lbL, lbR))
+
+_inRange(cond) =>
+    bars = ta.barssince(cond)
+    rangeLower <= bars and bars <= rangeUpper
+
+// Regular Bullish: Price makes Lower Low, RSI makes Higher Low
+oscHL       = osc[lbR] > ta.valuewhen(plFound, osc[lbR], 1) and _inRange(plFound[1])
+priceLL     = low[lbR]  < ta.valuewhen(plFound, low[lbR],  1)
+bullCond    = enable_rsi and plotBull and priceLL and oscHL and plFound
+
+// Hidden Bullish: Price makes Higher Low, RSI makes Lower Low
+oscLL       = osc[lbR] < ta.valuewhen(plFound, osc[lbR], 1) and _inRange(plFound[1])
+priceHL     = low[lbR]  > ta.valuewhen(plFound, low[lbR],  1)
+hiddenBullCond = enable_rsi and plotHiddenBull and priceHL and oscLL and plFound
+
+// Regular Bearish: Price makes Higher High, RSI makes Lower High
+oscLH       = osc[lbR] < ta.valuewhen(phFound, osc[lbR], 1) and _inRange(phFound[1])
+priceHH     = high[lbR] > ta.valuewhen(phFound, high[lbR], 1)
+bearCond    = enable_rsi and plotBear and priceHH and oscLH and phFound
+
+// Hidden Bearish: Price makes Lower High, RSI makes Higher High
+oscHH       = osc[lbR] > ta.valuewhen(phFound, osc[lbR], 1) and _inRange(phFound[1])
+priceLH     = high[lbR] < ta.valuewhen(phFound, high[lbR], 1)
+hiddenBearCond = enable_rsi and plotHiddenBear and priceLH and oscHH and phFound
+
+// ============================================================
+// 🔹 DIVERGENCE LABELS  *** PRESERVED ***
+// ============================================================
+plotshape(bullCond,       offset=-lbR, location=location.belowbar, color=color.lime,                 style=shape.labelup,   text="Bull")
+plotshape(hiddenBullCond, offset=-lbR, location=location.belowbar, color=color.new(color.lime,  70), style=shape.labelup,   text="H Bull")
+plotshape(bearCond,       offset=-lbR, location=location.abovebar, color=color.red,                  style=shape.labeldown, text="Bear")
+plotshape(hiddenBearCond, offset=-lbR, location=location.abovebar, color=color.new(color.red,   70), style=shape.labeldown, text="H Bear")
+
+// ============================================================
+// 🔹 ATR CALCULATION (used by multiple systems)
+// ============================================================
+atrValue = ta.atr(atrLen)
+
+// ============================================================
+// 🔹 SUPPORT / RESISTANCE ENGINE
+// FIX #2:  Zone polarity is now tracked — pivot highs create
+//          resistance zones, pivot lows create support zones.
+//          Polarity is locked at creation, not reclassified per bar.
+// FIX #9:  Zone width uses ATR × multiplier instead of fixed %.
+// FIX #12: minstrength is now enforced when building the channel array.
+// ============================================================
+float src1 = ppsrc == "High/Low" ? high : math.max(close, open)
+float src2 = ppsrc == "High/Low" ? low  : math.min(close, open)
+
+ph = ta.pivothigh(src1, prd, prd)
+pl = ta.pivotlow(src2,  prd, prd)
+
+prdhighest = ta.highest(300)
+prdlowest  = ta.lowest(300)
+
+// FIX #9: ATR-based zone width or fallback to fixed %
+cwidth = useAtrWidth ? atrValue * atrWidthMult : (prdhighest - prdlowest) * ChannelW / 100
+
+var pivotvals  = array.new_float()
+var pivotlocs  = array.new_float()
+var pivottypes = array.new_int()    // FIX #2: 1 = resistance (from pivot high), -1 = support (from pivot low)
+
+if enable_sr and (not na(ph) or not na(pl))
+    array.unshift(pivotvals,  not na(ph) ? ph : pl)
+    array.unshift(pivotlocs,  bar_index)
+    array.unshift(pivottypes, not na(ph) ? 1 : -1)  // FIX #2: lock polarity at creation
+    for i = array.size(pivotvals) - 1 to 0
+        if bar_index - array.get(pivotlocs, i) > loopback
+            array.pop(pivotvals)
+            array.pop(pivotlocs)
+            array.pop(pivottypes)
+
+get_sr_vals(ind) =>
+    float lo  = array.get(pivotvals, ind)
+    float hi  = lo
+    int numpp = 0
+    int polarity = array.get(pivottypes, ind)  // FIX #2: inherit polarity from seed pivot
+    for y = 0 to array.size(pivotvals) - 1
+        float cpp  = array.get(pivotvals, y)
+        float wdth = cpp <= hi ? hi - cpp : cpp - lo
+        if wdth <= cwidth
+            lo    := math.min(lo, cpp)
+            hi    := math.max(hi, cpp)
+            numpp += 20
+    [hi, lo, numpp, polarity]
+
+// ============================================================
+// 🔹 BUILD S/R CHANNELS
+// FIX #2: srPolarity array stores locked zone type (1=res, -1=sup)
+// FIX #12: minstrength filter applied — zones below threshold are skipped
+// ============================================================
+var srArr      = array.new_float(20, 0)
+var srPolarity = array.new_int(10, 0)  // FIX #2: polarity per zone
+
+if enable_sr and (not na(ph) or not na(pl))
+    supres   = array.new_float()
+    polArr   = array.new_int()
+
+    for i = 0 to array.size(pivotvals) - 1
+        [hi, lo, str, pol] = get_sr_vals(i)
+        array.push(supres, str)
+        array.push(supres, hi)
+        array.push(supres, lo)
+        array.push(polArr, pol)
+
+    array.fill(srArr, 0)
+    for p = 0 to 9
+        array.set(srPolarity, p, 0)
+
+    idx = 0
+    for i = 0 to array.size(pivotvals) - 1
+        if idx >= 10
+            break
+        float str_val = array.get(supres, i * 3)
+        // FIX #12: skip zones that don't meet minimum strength
+        if str_val < minstrength * 20
+            continue
+        hh = array.get(supres, i * 3 + 1)
+        ll = array.get(supres, i * 3 + 2)
+        array.set(srArr, idx * 2,     hh)
+        array.set(srArr, idx * 2 + 1, ll)
+        array.set(srPolarity, idx, array.get(polArr, i))  // FIX #2
+        idx += 1
+
+// ============================================================
+// 🔹 DRAW S/R BOXES
+// FIX #2: Color based on locked polarity, not price-relative position
+// ============================================================
+var srBoxes = array.new_box(10)
+
+for i = 0 to math.min(9, maxnumsr)
+    box.delete(array.get(srBoxes, i))
+    top = array.get(srArr, i * 2)
+    bot = array.get(srArr, i * 2 + 1)
+    if top != 0
+        int pol = array.get(srPolarity, i)
+        // FIX #2: polarity-based coloring (1=resistance=red, -1=support=green)
+        col = pol > 0 ? res_col : sup_col
+        array.set(srBoxes, i,
+             box.new(bar_index, top, bar_index + 1, bot,
+                     extend=extend.both,
+                     bgcolor=col,
+                     border_color=col))
+
+// ============================================================
+// 🔹 NEAR S/R FILTER
+// FIX #1: Uses ATR buffer + wick-based detection instead of
+//         requiring close to sit exactly inside the zone.
+//         - For support zones: checks if candle low reaches within
+//           zone + ATR buffer (catches wick probes)
+//         - For resistance zones: checks if candle high reaches within
+//           zone - ATR buffer
+//         Also outputs separate nearSupport / nearResistance flags
+//         for candlestick pattern filtering.
+// ============================================================
+nearSR         = true
+nearSupport    = false
+nearResistance = false
+
+if enable_sr
+    nearSR := false
+    float buffer = atrValue * srProxBuffer   // FIX #1: ATR-based proximity buffer
+    for i = 0 to 9
+        top = array.get(srArr, i * 2)
+        bot = array.get(srArr, i * 2 + 1)
+        int pol = array.get(srPolarity, i)
+        if top != 0
+            // FIX #1: Wick-based proximity — low must touch support, high must touch resistance
+            if pol <= 0   // Support zone
+                if low <= top + buffer and low >= bot - buffer
+                    nearSR      := true
+                    nearSupport := true
+                if close <= top and close >= bot
+                    nearSR      := true
+                    nearSupport := true
+            if pol > 0    // Resistance zone
+                if high >= bot - buffer and high <= top + buffer
+                    nearSR         := true
+                    nearResistance := true
+                if close <= top and close >= bot
+                    nearSR         := true
+                    nearResistance := true
+
+// ============================================================
+// 🔹 TREND FILTER
+// FIX #5: Multi-timeframe EMA from Daily chart for genuine
+//         trend context. On a 15m chart, the chart-level EMA-200
+//         only covers ~50 hours. The daily EMA-200 covers ~10 months.
+//         Falls back to chart-level EMA if MTF is disabled.
+// ============================================================
+emaChart    = ta.ema(close, emaLen)
+emaMTF      = request.security(syminfo.tickerid, "D", ta.ema(close, emaLen))  // FIX #5
+
+ema200      = useMTFTrend ? emaMTF : emaChart
+plot(emaChart, "EMA (Chart)", color=color.new(color.orange, 50), linewidth=1)
+plot(useMTFTrend ? emaMTF : na, "EMA (Daily MTF)", color=color.new(color.orange, 0), linewidth=2)
+
+trendUp     = not useTrend or close > ema200
+trendDown   = not useTrend or close < ema200
+
+// ============================================================
+// 🔹 CHOP FILTER — ADX
+// FIX #6: Default threshold raised to 25. Forex majors often
+//         show ADX 20-25 during range-bound conditions.
+//         Additionally requires directional alignment (DI+ ≠ DI-)
+//         for extra confirmation.
+// ============================================================
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+// FIX #6: ADX > threshold AND clear directional bias
+isTrending  = not useChop or (adxVal > adxThresh and math.abs(diPlus - diMinus) > 5)
+
+// ============================================================
+// 🔹 SESSION FILTER
+// FIX #4: Added Asian session (00:00–09:00 UTC) for JPY, AUD, NZD pairs.
+//         Disabled by default — enable via input for relevant pairs.
+// ============================================================
+inLondon    = not useSession or not na(time(timeframe.period, londonSess, "UTC"))
+inNY        = not useSession or not na(time(timeframe.period, nySess,     "UTC"))
+inAsian     = useAsianSess and not na(time(timeframe.period, asianSess,   "UTC"))  // FIX #4
+inSession   = inLondon or inNY or inAsian
+
+// ============================================================
+// 🔹 CANDLESTICK PATTERN CONFIRMATION AT S/R ZONES
+// Detects Hammer, Bullish Engulfing, Bearish Engulfing
+// ONLY when they form directly at existing S/R zones.
+// Strict definitions — no weak/ambiguous candles.
+// ============================================================
+
+// --- Candle body measurements ---
+float cBodySize  = math.abs(close - open)
+float cRange     = high - low
+float cUpperWick = high - math.max(close, open)
+float cLowerWick = math.min(close, open) - low
+
+// --- Previous candle direction ---
+bool prevCandleBearish = close[1] < open[1]
+bool prevCandleBullish = close[1] > open[1]
+
+// --- Body boundaries (current & previous) ---
+float prevBodyHi = math.max(open[1], close[1])
+float prevBodyLo = math.min(open[1], close[1])
+float currBodyHi = math.max(open, close)
+float currBodyLo = math.min(open, close)
+
+// --- Quality filter: reject tiny/insignificant candles ---
+float cAvgRange  = ta.sma(cRange, 20)
+bool  cValidSize = cRange > cAvgRange * 0.5
+
+// HAMMER — at Support only, after a bearish candle, in uptrend
+//   • Small real body (≤35% of range)
+//   • Long lower wick (≥60% of range)
+//   • Very small or no upper wick (≤15% of range)
+//   • Must align with trend (price above EMA = uptrend pullback to support)
+bool hammerAtSupport = enableCandle
+     and isMajor
+     and cValidSize
+     and cRange > 0
+     and cBodySize <= cRange * 0.35
+     and cLowerWick >= cRange * 0.60
+     and cUpperWick <= cRange * 0.15
+     and prevCandleBearish
+     and nearSupport
+     and trendUp
+
+// BULLISH ENGULFING — at Support only, after a bearish candle, in uptrend
+//   • Previous candle bearish, current candle bullish
+//   • Current body fully engulfs previous body
+//   • Strong body (≥40% of candle range)
+//   • Must align with trend (uptrend pullback to support)
+bool bullEngulfAtSupport = enableCandle
+     and isMajor
+     and cValidSize
+     and prevCandleBearish
+     and close > open
+     and currBodyHi > prevBodyHi
+     and currBodyLo < prevBodyLo
+     and cBodySize >= cRange * 0.40
+     and nearSupport
+     and trendUp
+
+// BEARISH ENGULFING — at Resistance only, after a bullish candle, in downtrend
+//   • Previous candle bullish, current candle bearish
+//   • Current body fully engulfs previous body
+//   • Strong body (≥40% of candle range)
+//   • Must align with trend (downtrend rally to resistance)
+bool bearEngulfAtResist = enableCandle
+     and isMajor
+     and cValidSize
+     and prevCandleBullish
+     and close < open
+     and currBodyHi > prevBodyHi
+     and currBodyLo < prevBodyLo
+     and cBodySize >= cRange * 0.40
+     and nearResistance
+     and trendDown
+
+// --- Candlestick Pattern Visual Markers ---
+plotshape(hammerAtSupport,     title="Hammer at Support",
+     style=shape.labelup,   location=location.belowbar,
+     color=color.green, size=size.normal,
+     text="HAMMER\nBUY",    textcolor=color.white)
+
+plotshape(bullEngulfAtSupport, title="Bullish Engulfing at Support",
+     style=shape.labelup,   location=location.belowbar,
+     color=color.green, size=size.normal,
+     text="BULL ENG\nBUY",  textcolor=color.white)
+
+plotshape(bearEngulfAtResist,  title="Bearish Engulfing at Resistance",
+     style=shape.labeldown, location=location.abovebar,
+     color=color.red,   size=size.normal,
+     text="BEAR ENG\nSELL", textcolor=color.white)
+
+// ============================================================
+// 🔹 COMPOSITE ENTRY CONDITIONS
+//    All confluence gates must pass simultaneously:
+//    1. RSI Divergence  2. Near S/R zone  3. Trend alignment
+//    4. Market is trending (ADX)  5. Active session
+// ============================================================
+longSignal  = (bullCond or hiddenBullCond) and nearSR and trendUp   and isTrending and inSession and isMajor
+shortSignal = (bearCond or hiddenBearCond) and nearSR and trendDown and isTrending and inSession and isMajor
+
+// ============================================================
+// 🔹 POSITION SIZING
+// FIX #11: Fixed-risk position sizing. Calculates qty so that if
+//          the SL is hit, exactly `riskPerTrade`% of equity is lost.
+//          Falls back to default 10% of equity if disabled.
+// ============================================================
+float slDistCalc = useATRSL ? atrValue * atrMult : close * slPerc / 100
+float riskAmount = strategy.equity * riskPerTrade / 100
+float calcQty    = slDistCalc > 0 ? riskAmount / slDistCalc : na
+float tradeQty   = useFixedRisk and not na(calcQty) ? calcQty : na
+
+// ============================================================
+// 🔹 ENTRY EXECUTION  (fills at NEXT bar open — no repainting)
+// ============================================================
+if longSignal and strategy.position_size <= 0
+    strategy.close("Short")
+    if useFixedRisk and not na(tradeQty)
+        strategy.entry("Long", strategy.long, qty=tradeQty)
+    else
+        strategy.entry("Long", strategy.long)
+
+if shortSignal and strategy.position_size >= 0
+    strategy.close("Long")
+    if useFixedRisk and not na(tradeQty)
+        strategy.entry("Short", strategy.short, qty=tradeQty)
+    else
+        strategy.entry("Short", strategy.short)
+
+// ============================================================
+// 🔹 STOP LOSS & TAKE PROFIT
+// FIX #8: Trailing stop option. When enabled, uses ATR-based
+//         Chandelier Exit instead of fixed TP. Better for trending
+//         forex moves where price can run beyond a fixed target.
+//         When disabled, uses the original fixed RR-based TP.
+// ============================================================
+if strategy.position_size > 0
+    slDist   = useATRSL ? atrValue * atrMult : strategy.position_avg_price * slPerc / 100
+    slLevel  = strategy.position_avg_price - slDist
+    if useTrailing
+        // FIX #8: Trailing stop — follows price up by ATR distance
+        trailLevel = close - atrValue * trailAtrMult
+        strategy.exit("Long Exit", "Long", stop=math.max(slLevel, trailLevel))
+    else
+        tpLevel = strategy.position_avg_price + slDist * rr
+        strategy.exit("Long Exit", "Long", stop=slLevel, limit=tpLevel)
+
+if strategy.position_size < 0
+    slDist   = useATRSL ? atrValue * atrMult : strategy.position_avg_price * slPerc / 100
+    slLevel  = strategy.position_avg_price + slDist
+    if useTrailing
+        // FIX #8: Trailing stop — follows price down by ATR distance
+        trailLevel = close + atrValue * trailAtrMult
+        strategy.exit("Short Exit", "Short", stop=math.min(slLevel, trailLevel))
+    else
+        tpLevel = strategy.position_avg_price - slDist * rr
+        strategy.exit("Short Exit", "Short", stop=slLevel, limit=tpLevel)
+
+// ============================================================
+// 🔹 SESSION-END AUTO-CLOSE
+// FIX #7: Closes all positions when outside active sessions to
+//         avoid overnight swap/rollover costs. Only active when
+//         both session filter and auto-close are enabled.
+// ============================================================
+if autoCloseEOD and useSession and not inSession and strategy.position_size != 0
+    strategy.close_all("Session End")
+
+// ============================================================
+// 🔹 VISUAL TRADE ZONES
+//    • Green box: Entry → Take Profit
+//    • Red box  : Entry → Stop Loss
+//    Boxes extend rightward 40 bars for visibility.
+// ============================================================
+var box tpBox = na
+var box slBox = na
+
+BOX_WIDTH = 40
+
+if showZones and longSignal
+    atrD    = useATRSL ? atrValue * atrMult : close * slPerc / 100
+    entryP  = close
+    slP     = entryP - atrD
+    tpP     = entryP + atrD * rr
+
+    box.delete(tpBox)
+    box.delete(slBox)
+
+    tpBox  := box.new(bar_index, tpP, bar_index + BOX_WIDTH, entryP,
+                      bgcolor=tpZoneCol,
+                      border_color=color.new(color.green, 40),
+                      border_width=1)
+    slBox  := box.new(bar_index, entryP, bar_index + BOX_WIDTH, slP,
+                      bgcolor=slZoneCol,
+                      border_color=color.new(color.red, 40),
+                      border_width=1)
+
+if showZones and shortSignal
+    atrD    = useATRSL ? atrValue * atrMult : close * slPerc / 100
+    entryP  = close
+    slP     = entryP + atrD
+    tpP     = entryP - atrD * rr
+
+    box.delete(tpBox)
+    box.delete(slBox)
+
+    tpBox  := box.new(bar_index, entryP, bar_index + BOX_WIDTH, tpP,
+                      bgcolor=tpZoneCol,
+                      border_color=color.new(color.green, 40),
+                      border_width=1)
+    slBox  := box.new(bar_index, slP, bar_index + BOX_WIDTH, entryP,
+                      bgcolor=slZoneCol,
+                      border_color=color.new(color.red, 40),
+                      border_width=1)
+
+// ============================================================
+// 🔹 FILTER STATUS DASHBOARD
+// Updated to show new filter states (MTF trend, Asian session, trailing)
+// ============================================================
+var table dash = table.new(position.top_right, 2, 8,
+     bgcolor=color.new(color.black, 60),
+     border_color=color.gray, border_width=1,
+     frame_color=color.gray, frame_width=1)
+
+if barstate.islast
+    table.cell(dash, 0, 0, "Filter",    text_color=color.white,  text_size=size.small, bgcolor=color.new(color.navy,40))
+    table.cell(dash, 1, 0, "Status",    text_color=color.white,  text_size=size.small, bgcolor=color.new(color.navy,40))
+
+    table.cell(dash, 0, 1, "EMA Trend", text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 1, useTrend ? (close > ema200 ? "▲ UP" : "▼ DOWN") : "OFF",
+         text_color = not useTrend ? color.gray : (close > ema200 ? color.lime : color.red),
+         text_size  = size.small)
+
+    // FIX #5: Show MTF status
+    table.cell(dash, 0, 2, "MTF EMA",   text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 2, useMTFTrend ? "Daily" : "Chart",
+         text_color = useMTFTrend ? color.lime : color.yellow,
+         text_size  = size.small)
+
+    table.cell(dash, 0, 3, "ADX Chop",  text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 3, useChop ? (isTrending ? "✔ Trending" : "✘ Choppy") : "OFF",
+         text_color = not useChop ? color.gray : (isTrending ? color.lime : color.red),
+         text_size  = size.small)
+
+    table.cell(dash, 0, 4, "Session",   text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 4, useSession ? (inSession ? "✔ Active" : "✘ Closed") : "OFF",
+         text_color = not useSession ? color.gray : (inSession ? color.lime : color.red),
+         text_size  = size.small)
+
+    table.cell(dash, 0, 5, "Near S/R",  text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 5, enable_sr ? (nearSR ? "✔ Yes" : "✘ No") : "OFF",
+         text_color = not enable_sr ? color.gray : (nearSR ? color.lime : color.red),
+         text_size  = size.small)
+
+    table.cell(dash, 0, 6, "SL Mode",   text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 6, useATRSL ? "ATR ×" + str.tostring(atrMult) : "% " + str.tostring(slPerc),
+         text_color=color.yellow, text_size=size.small)
+
+    // FIX #8, #11: Show trailing & sizing mode
+    table.cell(dash, 0, 7, "TP Mode",   text_color=color.silver, text_size=size.small)
+    table.cell(dash, 1, 7, useTrailing ? "Trail ×" + str.tostring(trailAtrMult) : "Fixed RR:" + str.tostring(rr),
+         text_color = useTrailing ? color.aqua : color.yellow,
+         text_size  = size.small)
+
+var table pairDash = table.new(position.bottom_right, 2, 1,
+     bgcolor=color.new(color.black, 60),
+     border_color=color.gray, border_width=1,
+     frame_color=color.gray, frame_width=1)
+
+if barstate.islast
+    table.cell(pairDash, 0, 0, "Pair", text_color=color.white, text_size=size.small, bgcolor=color.new(color.navy,40))
+    table.cell(pairDash, 1, 0, isMajor ? syminfo.ticker + " ✔" : syminfo.ticker + " ✘ (not major)",
+         text_color = isMajor ? color.lime : color.red,
+         text_size  = size.small)
+
+// ============================================================
+// 🔹 ALERTS  (all original + new candlestick pattern alerts)
+// ============================================================
+alertcondition(longSignal,          "✅ BUY Signal (Filtered)",             "Bullish RSI Div — All Filters Passed")
+alertcondition(shortSignal,         "🔴 SELL Signal (Filtered)",            "Bearish RSI Div — All Filters Passed")
+alertcondition(bullCond,            "Bullish Divergence (Raw)",             "Regular Bullish RSI Divergence")
+alertcondition(bearCond,            "Bearish Divergence (Raw)",             "Regular Bearish RSI Divergence")
+alertcondition(hiddenBullCond,      "Hidden Bullish (Raw)",                 "Hidden Bullish RSI Divergence")
+alertcondition(hiddenBearCond,      "Hidden Bearish (Raw)",                 "Hidden Bearish RSI Divergence")
+alertcondition(hammerAtSupport,     "🔨 Hammer at Support",                "Hammer candle confirmed at Support zone")
+alertcondition(bullEngulfAtSupport, "📈 Bull Engulfing at Support",        "Bullish Engulfing confirmed at Support zone")
+alertcondition(bearEngulfAtResist,  "📉 Bear Engulfing at Resistance",     "Bearish Engulfing confirmed at Resistance zone")
+
+// ============================================================
+// ✅ END OF SCRIPT
+// ============================================================
